@@ -116,6 +116,65 @@ textarea { min-height: 90px; resize: vertical; }
   margin: 0 6px 6px 0;
 }
 
+.pill-internal {
+  background: #ead7e8;
+  color: #5c1050;
+}
+.role-creator {
+  background: var(--gold);
+  color: var(--ink);
+}
+.role-mod {
+  background: #ead0d0;
+  color: var(--maroon-dark);
+}
+.role-member {
+  background: #eee8df;
+  color: var(--muted);
+}
+
+.member-list {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+}
+.member-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.member-list li:last-child { border-bottom: 0; }
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 16px 0 6px;
+  font-weight: 600;
+}
+.check-row input {
+  width: auto;
+  margin-top: 4px;
+}
+
+.request-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.request-row:last-of-type { border-bottom: 0; }
+
+.btn-sm {
+  padding: 6px 10px;
+  font-size: 0.88rem;
+}
+
 .group-card h3 { margin: 0 0 6px; }
 .meta { color: var(--muted); font-size: 0.92rem; }
 .split { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; }

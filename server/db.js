@@ -77,7 +77,18 @@ function createSchema() {
       type TEXT NOT NULL,
       created_by INTEGER NOT NULL,
       created_at TEXT NOT NULL,
+      join_policy TEXT NOT NULL DEFAULT 'open',
       FOREIGN KEY (created_by) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS join_requests (
+      group_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (group_id, user_id),
+      FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS group_members (
@@ -126,6 +137,39 @@ function createSchema() {
   `);
 }
 
+function columnExists(table, column) {
+  try {
+    return all(`PRAGMA table_info(${table})`).some((c) => c.name === column);
+  } catch {
+    return false;
+  }
+}
+
+function migrate() {
+  if (!columnExists("groups", "join_policy")) {
+    try {
+      run("ALTER TABLE groups ADD COLUMN join_policy TEXT NOT NULL DEFAULT 'open'");
+    } catch {
+      // Column already present on this sqlite file.
+    }
+    const cs = get("SELECT id FROM groups WHERE name = ?", ["CS Study Circle"]);
+    if (cs) {
+      run("UPDATE groups SET join_policy = 'internal' WHERE id = ?", [cs.id]);
+    }
+  }
+  db.run(`
+    CREATE TABLE IF NOT EXISTS join_requests (
+      group_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (group_id, user_id),
+      FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+  `);
+}
+
 function seedIfEmpty() {
   const count = get("SELECT COUNT(*) AS n FROM users");
   if (count.n > 0) return;
@@ -133,35 +177,8 @@ function seedIfEmpty() {
   const password = bcrypt.hashSync("hangout123", 10);
   const people = [
     {
-      email: "riddhi@umass.edu",
-      first: "Riddhi",
-      last: "Maniktalia",
-      dept: "Computer Science",
-      year: 2026,
-      bio: "Building community one hangout at a time.",
-      tags: ["night owl", "group study", "hackathons"],
-    },
-    {
-      email: "ishita@umass.edu",
-      first: "Ishita",
-      last: "Chauhan",
-      dept: "Computer Science",
-      year: 2026,
-      bio: "Always down for coffee and a whiteboard.",
-      tags: ["visual learner", "coffee chats", "algorithms"],
-    },
-    {
-      email: "harshita@umass.edu",
-      first: "Harshita",
-      last: "Vidapanakal",
-      dept: "Computer Science",
-      year: 2026,
-      bio: "Looking for hiking buddies and study sprints.",
-      tags: ["outdoors", "pomodoro", "weekends"],
-    },
-    {
       email: "kaushik@umass.edu",
-      first: "Kaushik Sai",
+      first: "Kaushik",
       last: "Karlapati",
       dept: "Computer Science",
       year: 2026,
@@ -169,9 +186,36 @@ function seedIfEmpty() {
       tags: ["sports", "evening", "CS 311"],
     },
     {
-      email: "swetha@umass.edu",
-      first: "Swetha",
-      last: "Eppalapally",
+      email: "demo1@umass.edu",
+      first: "Demo Person",
+      last: "1",
+      dept: "Computer Science",
+      year: 2026,
+      bio: "Building community one hangout at a time.",
+      tags: ["night owl", "group study", "hackathons"],
+    },
+    {
+      email: "demo2@umass.edu",
+      first: "Demo Person",
+      last: "2",
+      dept: "Computer Science",
+      year: 2026,
+      bio: "Always down for coffee and a whiteboard.",
+      tags: ["visual learner", "coffee chats", "algorithms"],
+    },
+    {
+      email: "demo3@umass.edu",
+      first: "Demo Person",
+      last: "3",
+      dept: "Computer Science",
+      year: 2026,
+      bio: "Looking for hiking buddies and study sprints.",
+      tags: ["outdoors", "pomodoro", "weekends"],
+    },
+    {
+      email: "demo4@umass.edu",
+      first: "Demo Person",
+      last: "4",
       dept: "Computer Science",
       year: 2026,
       bio: "Notes, playlists, and good group energy.",
@@ -202,7 +246,8 @@ function seedIfEmpty() {
       description: "Weekly problem sets, exam review, and shared notes for CS courses.",
       type: "study",
       owner: userIds[0],
-      members: userIds,
+      members: [userIds[0], userIds[1]],
+      join_policy: "internal",
     },
     {
       name: "Intramural Soccer",
@@ -210,6 +255,7 @@ function seedIfEmpty() {
       type: "sports",
       owner: userIds[3],
       members: [userIds[3], userIds[1], userIds[2]],
+      join_policy: "open",
     },
     {
       name: "Weekend Hiking",
@@ -217,6 +263,7 @@ function seedIfEmpty() {
       type: "social",
       owner: userIds[2],
       members: [userIds[2], userIds[0], userIds[4]],
+      join_policy: "open",
     },
     {
       name: "Campus Coffee Club",
@@ -224,14 +271,15 @@ function seedIfEmpty() {
       type: "social",
       owner: userIds[1],
       members: [userIds[1], userIds[4], userIds[0]],
+      join_policy: "open",
     },
   ];
 
   const groupIds = [];
   for (const g of groups) {
     run(
-      "INSERT INTO groups (name, description, type, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-      [g.name, g.description, g.type, g.owner, now]
+      "INSERT INTO groups (name, description, type, created_by, created_at, join_policy) VALUES (?, ?, ?, ?, ?, ?)",
+      [g.name, g.description, g.type, g.owner, now, g.join_policy || "open"]
     );
     const gid = lastId();
     groupIds.push(gid);
@@ -279,7 +327,7 @@ function seedIfEmpty() {
   const chat = [
     [groupIds[0], userIds[0], "Welcome to CS Study Circle — drop your course and what you're stuck on."],
     [groupIds[0], userIds[1], "Anyone reviewing 311 tonight?"],
-    [groupIds[0], userIds[4], "I uploaded last week's notes in Resources."],
+    [groupIds[0], userIds[1], "I uploaded last week's notes in Resources."],
     [groupIds[1], userIds[3], "Pickup at 6 by the rec fields if the weather holds."],
     [groupIds[2], userIds[2], "Trail looks dry this weekend. Who's in?"],
   ];
@@ -304,6 +352,7 @@ async function initDb() {
     db = new SQL.Database();
   }
   createSchema();
+  migrate();
   seedIfEmpty();
   persist();
   return { run, all, get, lastId, persist };

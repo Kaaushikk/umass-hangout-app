@@ -103,12 +103,14 @@ async function ensureAuth() {
 }
 
 function groupCard(g) {
+  const internal = (g.join_policy || "open") === "internal";
   return `
     <article class="card group-card">
       <span class="pill">${escapeHtml(g.type)}</span>
+      ${internal ? `<span class="pill pill-internal">Internal</span>` : ""}
       <h3>${escapeHtml(g.name)}</h3>
       <p>${escapeHtml(g.description)}</p>
-      <p class="meta">${g.memberCount} members</p>
+      <p class="meta">${g.memberCount} members${internal ? " · approval required" : ""}</p>
       <a class="btn" href="#/groups/${g.id}">Open group</a>
     </article>
   `;
@@ -132,7 +134,7 @@ function renderLogin(err = "") {
             <a href="#/register">Create an account</a>
           </div>
         </form>
-        <p class="meta" style="margin-top:18px">Demo: riddhi@umass.edu / hangout123</p>
+        <p class="meta" style="margin-top:18px">Demo: kaushik@umass.edu / hangout123<br />Also Demo Person 1–4: demo1@umass.edu through demo4@umass.edu</p>
       </div>
     </div>
   `;
@@ -270,6 +272,11 @@ async function renderCreate(msg = "") {
           <option value="social">Social</option>
           <option value="sports">Sports</option>
         </select>
+        <label class="check-row">
+          <input type="checkbox" name="internal" />
+          <span>Internal — require approval to join</span>
+        </label>
+        <p class="meta">Open groups let anyone join immediately. Internal groups wait for a moderator to approve each request.</p>
         <div class="row" style="margin-top:16px"><button class="btn" type="submit">Create group</button></div>
       </form>
     </div>
@@ -284,6 +291,7 @@ async function renderCreate(msg = "") {
           name: fd.get("name"),
           description: fd.get("description"),
           type: fd.get("type"),
+          join_policy: fd.get("internal") ? "internal" : "open",
         }),
       });
       location.hash = "#/groups/" + g.id;
@@ -370,25 +378,116 @@ function fmtWhen(iso) {
   }
 }
 
-async function renderGroup(id) {
+function roleBadges(m) {
+  const parts = [];
+  if (m.isCreator) parts.push(`<span class="pill role-creator">Creator</span>`);
+  if (m.isModerator) parts.push(`<span class="pill role-mod">Moderator</span>`);
+  if (!m.isCreator && !m.isModerator) parts.push(`<span class="pill role-member">Member</span>`);
+  return parts.join("");
+}
+
+function yourStatus(g) {
+  if (g.joined) {
+    if (g.isCreator) return "you are the creator";
+    if (g.isModerator) return "you are a moderator";
+    return "you are a member";
+  }
+  if (g.requestStatus === "pending") return "waiting for approval";
+  if (g.requestStatus === "denied") return "your last request was denied";
+  return "you are not a member";
+}
+
+function joinLeaveControls(g) {
+  if (g.joined) return `<button class="btn ghost" id="leave">Leave group</button>`;
+  if ((g.join_policy || "open") === "internal") {
+    if (g.requestStatus === "pending") {
+      return `<button class="btn" id="join" disabled>Waiting for approval</button>`;
+    }
+    return `<button class="btn" id="join">Request to join</button>`;
+  }
+  return `<button class="btn" id="join">Join group</button>`;
+}
+
+async function renderGroup(id, msg = "") {
   if (!(await ensureAuth())) return render();
   const g = await api("/api/groups/" + id);
   let messages = [];
   if (g.joined) messages = await api("/api/groups/" + id + "/messages");
+  const internal = (g.join_policy || "open") === "internal";
+  const meId = state.me?.user?.id;
+  const pendingNote =
+    !g.joined && g.requestStatus === "pending"
+      ? banner("Waiting for a moderator to approve your request. You’ll see members, chat, files, and events after you’re in.", "ok")
+      : !g.joined && internal
+        ? `<p class="meta">This is an internal group. A moderator must approve your request before you can join.</p>`
+        : "";
 
   layout(`
     <div class="split">
       <div>
         <div class="card">
           <span class="pill">${escapeHtml(g.type)}</span>
+          ${internal ? `<span class="pill pill-internal">Internal</span>` : ""}
           <h1>${escapeHtml(g.name)}</h1>
           <p>${escapeHtml(g.description)}</p>
-          <p class="meta">${g.memberCount} members · you are ${g.role || "not a member"}</p>
+          <p class="meta">${g.memberCount} members · created by ${escapeHtml(g.creator?.name || "a student")} · ${yourStatus(g)}</p>
+          ${banner(msg, msg.includes("last moderator") || msg.includes("failed") || msg.includes("Only") ? "err" : msg ? "ok" : "err")}
+          ${pendingNote}
           <div class="row">
-            ${g.joined ? `<button class="btn ghost" id="leave">Leave group</button>` : `<button class="btn" id="join">Join group</button>`}
+            ${joinLeaveControls(g)}
           </div>
         </div>
         <div class="card" style="margin-top:16px">
+          <h2>People in this group</h2>
+          ${
+            g.joined
+              ? `<ul class="member-list">
+                  ${(g.members || [])
+                    .map(
+                      (m) => `
+                    <li>
+                      <div>
+                        <strong>${escapeHtml(m.name)}</strong>
+                        ${roleBadges(m)}
+                      </div>
+                      ${
+                        g.isCreator && !m.isModerator && m.id !== meId
+                          ? `<button class="btn ghost btn-sm promote-btn" data-user-id="${m.id}">Make moderator</button>`
+                          : ""
+                      }
+                    </li>`
+                    )
+                    .join("")}
+                </ul>`
+              : `<p class="meta">${internal ? "Member list is visible after you are approved." : "Join this group to see who is in it."}</p>`
+          }
+        </div>
+        ${
+          g.isModerator
+            ? `<div class="card" style="margin-top:16px">
+                <h2>Join requests</h2>
+                ${
+                  (g.pendingRequests || []).length
+                    ? (g.pendingRequests || [])
+                        .map(
+                          (r) => `
+                    <div class="request-row">
+                      <span>${escapeHtml(r.name)}</span>
+                      <div class="row">
+                        <button class="btn btn-sm approve-btn" data-user-id="${r.id}">Approve</button>
+                        <button class="btn ghost btn-sm deny-btn" data-user-id="${r.id}">Deny</button>
+                      </div>
+                    </div>`
+                        )
+                        .join("")
+                    : "<p class='meta'>No pending requests.</p>"
+                }
+              </div>`
+            : ""
+        }
+        ${
+          g.joined
+            ? `<div class="card" style="margin-top:16px">
           <h2>Events</h2>
           ${(g.events || [])
             .map(
@@ -397,12 +496,12 @@ async function renderGroup(id) {
               <b>${escapeHtml(ev.title)}</b>
               <p class="meta">${escapeHtml(fmtWhen(ev.starts_at))} · ${escapeHtml(ev.location)}</p>
               <p>${escapeHtml(ev.description || "")}</p>
-              ${g.joined ? `<a href="/api/events/${ev.id}.ics" target="_blank">Add to calendar (.ics)</a>` : ""}
+              <a href="/api/events/${ev.id}.ics" target="_blank">Add to calendar (.ics)</a>
             </div>`
             )
             .join("") || "<p class='meta'>No events yet.</p>"}
           ${
-            g.role === "admin"
+            g.isModerator
               ? `<form id="event-form">
                   <label>New event title</label><input name="title" required />
                   <label>Location</label><input name="location" required />
@@ -410,7 +509,7 @@ async function renderGroup(id) {
                   <label>Description</label><textarea name="description"></textarea>
                   <button class="btn" style="margin-top:12px" type="submit">Create event</button>
                 </form>`
-              : "<p class='meta'>Only the group admin can create events.</p>"
+              : "<p class='meta'>Only a moderator can create events.</p>"
           }
         </div>
         <div class="card" style="margin-top:16px">
@@ -421,12 +520,10 @@ async function renderGroup(id) {
                 `<p><a href="/uploads/${encodeURIComponent(r.filename)}" target="_blank">${escapeHtml(r.original_name)}</a> <span class="meta">by ${escapeHtml(r.uploader)}</span></p>`
             )
             .join("") || "<p class='meta'>No files yet.</p>"}
-          ${
-            g.joined
-              ? `<form id="file-form"><input type="file" name="file" required /><button class="btn" type="submit">Upload</button></form>`
-              : ""
-          }
-        </div>
+          <form id="file-form"><input type="file" name="file" required /><button class="btn" type="submit">Upload</button></form>
+        </div>`
+            : ""
+        }
       </div>
       <div class="card">
         <h2>Group chat</h2>
@@ -442,7 +539,7 @@ async function renderGroup(id) {
                  <input name="body" placeholder="Send a message" style="flex:1" />
                  <button class="btn" type="submit">Send</button>
                </form>`
-            : "<p>Join this group to chat.</p>"
+            : `<p>${internal ? "Request to join and wait for approval to chat." : "Join this group to chat."}</p>`
         }
       </div>
     </div>
@@ -450,17 +547,65 @@ async function renderGroup(id) {
 
   const join = document.getElementById("join");
   const leave = document.getElementById("leave");
-  if (join)
+  if (join && !join.disabled)
     join.onclick = async () => {
-      await api("/api/groups/" + id + "/join", { method: "POST", body: "{}" });
-      render();
+      try {
+        await api("/api/groups/" + id + "/join", { method: "POST", body: "{}" });
+        renderGroup(id);
+      } catch (ex) {
+        renderGroup(id, ex.message);
+      }
     };
   if (leave)
     leave.onclick = async () => {
-      await api("/api/groups/" + id + "/leave", { method: "POST", body: "{}" });
-      location.hash = "#/";
-      render();
+      try {
+        await api("/api/groups/" + id + "/leave", { method: "POST", body: "{}" });
+        location.hash = "#/";
+        render();
+      } catch (ex) {
+        renderGroup(id, ex.message);
+      }
     };
+
+  document.querySelectorAll(".approve-btn").forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await api("/api/groups/" + id + "/requests/" + btn.dataset.userId + "/approve", {
+          method: "POST",
+          body: "{}",
+        });
+        renderGroup(id);
+      } catch (ex) {
+        renderGroup(id, ex.message);
+      }
+    };
+  });
+  document.querySelectorAll(".deny-btn").forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await api("/api/groups/" + id + "/requests/" + btn.dataset.userId + "/deny", {
+          method: "POST",
+          body: "{}",
+        });
+        renderGroup(id);
+      } catch (ex) {
+        renderGroup(id, ex.message);
+      }
+    };
+  });
+  document.querySelectorAll(".promote-btn").forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await api("/api/groups/" + id + "/members/" + btn.dataset.userId + "/promote", {
+          method: "POST",
+          body: "{}",
+        });
+        renderGroup(id);
+      } catch (ex) {
+        renderGroup(id, ex.message);
+      }
+    };
+  });
 
   const eventForm = document.getElementById("event-form");
   if (eventForm) {

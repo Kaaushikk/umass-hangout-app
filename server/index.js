@@ -95,27 +95,79 @@ async function main() {
     return !!db.get("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", [groupId, userId]);
   }
 
+  function isModerator(groupId, userId) {
+    const row = db.get("SELECT role FROM group_members WHERE group_id = ? AND user_id = ?", [groupId, userId]);
+    return row?.role === "admin";
+  }
+
   function groupPayload(group, userId) {
     const members = db.all(
       `SELECT u.id, u.email, p.first_name, p.last_name, gm.role
        FROM group_members gm
        JOIN users u ON u.id = gm.user_id
        LEFT JOIN user_profile p ON p.user_id = u.id
-       WHERE gm.group_id = ?`,
+       WHERE gm.group_id = ?
+       ORDER BY CASE gm.role WHEN 'admin' THEN 0 ELSE 1 END, p.first_name, u.email`,
       [group.id]
     );
-    return {
+    const joined = members.some((m) => m.id === userId);
+    const myRole = members.find((m) => m.id === userId)?.role || null;
+    const moderator = myRole === "admin";
+    const creatorRow = db.get(
+      `SELECT u.id, u.email, p.first_name, p.last_name
+       FROM users u
+       LEFT JOIN user_profile p ON p.user_id = u.id
+       WHERE u.id = ?`,
+      [group.created_by]
+    );
+    const request = !joined
+      ? db.get("SELECT status FROM join_requests WHERE group_id = ? AND user_id = ?", [group.id, userId])
+      : null;
+
+    const payload = {
       ...group,
+      join_policy: group.join_policy || "open",
       memberCount: members.length,
-      joined: members.some((m) => m.id === userId),
-      role: members.find((m) => m.id === userId)?.role || null,
-      members: members.map((m) => ({
-        id: m.id,
-        email: m.email,
-        name: displayName(m),
-        role: m.role,
-      })),
+      joined,
+      role: myRole,
+      isCreator: group.created_by === userId,
+      isModerator: moderator,
+      requestStatus: request?.status || null,
+      creator: creatorRow
+        ? { id: creatorRow.id, email: creatorRow.email, name: displayName(creatorRow) }
+        : null,
+      members: joined
+        ? members.map((m) => ({
+            id: m.id,
+            email: m.email,
+            name: displayName(m),
+            role: m.role,
+            isCreator: m.id === group.created_by,
+            isModerator: m.role === "admin",
+          }))
+        : [],
     };
+
+    if (moderator) {
+      payload.pendingRequests = db
+        .all(
+          `SELECT u.id, u.email, p.first_name, p.last_name, jr.created_at
+           FROM join_requests jr
+           JOIN users u ON u.id = jr.user_id
+           LEFT JOIN user_profile p ON p.user_id = u.id
+           WHERE jr.group_id = ? AND jr.status = 'pending'
+           ORDER BY jr.created_at ASC`,
+          [group.id]
+        )
+        .map((r) => ({
+          id: r.id,
+          email: r.email,
+          name: displayName(r),
+          created_at: r.created_at,
+        }));
+    }
+
+    return payload;
   }
 
   const app = express();
@@ -248,14 +300,12 @@ async function main() {
     }
     const allowed = ["study", "social", "sports"];
     const kind = allowed.includes(type) ? type : "social";
+    const join_policy = req.body.join_policy === "internal" ? "internal" : "open";
     const now = new Date().toISOString();
-    db.run("INSERT INTO groups (name, description, type, created_by, created_at) VALUES (?, ?, ?, ?, ?)", [
-      name,
-      description,
-      kind,
-      req.user.id,
-      now,
-    ]);
+    db.run(
+      "INSERT INTO groups (name, description, type, created_by, created_at, join_policy) VALUES (?, ?, ?, ?, ?, ?)",
+      [name, description, kind, req.user.id, now, join_policy]
+    );
     const id = db.lastId();
     db.run("INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, 'admin', ?)", [
       id,
@@ -269,41 +319,140 @@ async function main() {
   app.get("/api/groups/:id", authMiddleware, (req, res) => {
     const group = db.get("SELECT * FROM groups WHERE id = ?", [req.params.id]);
     if (!group) return res.status(404).json({ message: "Group not found" });
-    const events = db.all("SELECT * FROM events WHERE group_id = ? ORDER BY starts_at", [group.id]);
-    const resources = db.all(
-      `SELECT r.*, p.first_name, p.last_name FROM resources r
-       LEFT JOIN user_profile p ON p.user_id = r.user_id
-       WHERE r.group_id = ? ORDER BY r.created_at DESC`,
-      [group.id]
-    );
+    const payload = groupPayload(group, req.user.id);
+    const events = payload.joined
+      ? db.all("SELECT * FROM events WHERE group_id = ? ORDER BY starts_at", [group.id])
+      : [];
+    const resources = payload.joined
+      ? db
+          .all(
+            `SELECT r.*, p.first_name, p.last_name FROM resources r
+             LEFT JOIN user_profile p ON p.user_id = r.user_id
+             WHERE r.group_id = ? ORDER BY r.created_at DESC`,
+            [group.id]
+          )
+          .map((r) => ({
+            ...r,
+            uploader: displayName(r),
+          }))
+      : [];
     res.json({
-      ...groupPayload(group, req.user.id),
+      ...payload,
       events,
-      resources: resources.map((r) => ({
-        ...r,
-        uploader: displayName(r),
-      })),
+      resources,
     });
   });
 
   app.post("/api/groups/:id/join", authMiddleware, (req, res) => {
     const group = db.get("SELECT * FROM groups WHERE id = ?", [req.params.id]);
     if (!group) return res.status(404).json({ message: "Group not found" });
-    if (!isMember(group.id, req.user.id)) {
-      db.run("INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)", [
+    if (isMember(group.id, req.user.id)) {
+      return res.json(groupPayload(db.get("SELECT * FROM groups WHERE id = ?", [group.id]), req.user.id));
+    }
+    const now = new Date().toISOString();
+    const policy = group.join_policy || "open";
+    if (policy === "internal") {
+      const existing = db.get("SELECT * FROM join_requests WHERE group_id = ? AND user_id = ?", [
         group.id,
         req.user.id,
-        new Date().toISOString(),
       ]);
+      if (!existing) {
+        db.run("INSERT INTO join_requests (group_id, user_id, status, created_at) VALUES (?, ?, 'pending', ?)", [
+          group.id,
+          req.user.id,
+          now,
+        ]);
+      } else if (existing.status !== "pending") {
+        db.run("UPDATE join_requests SET status = 'pending', created_at = ? WHERE group_id = ? AND user_id = ?", [
+          now,
+          group.id,
+          req.user.id,
+        ]);
+      }
+      return res.json(groupPayload(db.get("SELECT * FROM groups WHERE id = ?", [group.id]), req.user.id));
     }
+    db.run("INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)", [
+      group.id,
+      req.user.id,
+      now,
+    ]);
     res.json(groupPayload(db.get("SELECT * FROM groups WHERE id = ?", [group.id]), req.user.id));
   });
 
   app.post("/api/groups/:id/leave", authMiddleware, (req, res) => {
     const group = db.get("SELECT * FROM groups WHERE id = ?", [req.params.id]);
     if (!group) return res.status(404).json({ message: "Group not found" });
+    const membership = db.get("SELECT role FROM group_members WHERE group_id = ? AND user_id = ?", [
+      group.id,
+      req.user.id,
+    ]);
+    if (!membership) return res.json({ ok: true });
+    if (membership.role === "admin") {
+      const admins = db.get("SELECT COUNT(*) AS n FROM group_members WHERE group_id = ? AND role = 'admin'", [
+        group.id,
+      ]);
+      if ((admins?.n || 0) <= 1) {
+        return res.status(400).json({
+          message: "You are the last moderator. Promote someone else before leaving.",
+        });
+      }
+    }
     db.run("DELETE FROM group_members WHERE group_id = ? AND user_id = ?", [group.id, req.user.id]);
     res.json({ ok: true });
+  });
+
+  app.post("/api/groups/:id/requests/:userId/approve", authMiddleware, (req, res) => {
+    const group = db.get("SELECT * FROM groups WHERE id = ?", [req.params.id]);
+    if (!group) return res.status(404).json({ message: "Group not found" });
+    if (!isModerator(group.id, req.user.id)) {
+      return res.status(403).json({ message: "Only a moderator can approve join requests." });
+    }
+    const userId = Number(req.params.userId);
+    const request = db.get(
+      "SELECT * FROM join_requests WHERE group_id = ? AND user_id = ? AND status = 'pending'",
+      [group.id, userId]
+    );
+    if (!request) return res.status(404).json({ message: "No pending request from that student." });
+    const now = new Date().toISOString();
+    if (!isMember(group.id, userId)) {
+      db.run("INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)", [
+        group.id,
+        userId,
+        now,
+      ]);
+    }
+    db.run("UPDATE join_requests SET status = 'approved' WHERE group_id = ? AND user_id = ?", [group.id, userId]);
+    res.json(groupPayload(db.get("SELECT * FROM groups WHERE id = ?", [group.id]), req.user.id));
+  });
+
+  app.post("/api/groups/:id/requests/:userId/deny", authMiddleware, (req, res) => {
+    const group = db.get("SELECT * FROM groups WHERE id = ?", [req.params.id]);
+    if (!group) return res.status(404).json({ message: "Group not found" });
+    if (!isModerator(group.id, req.user.id)) {
+      return res.status(403).json({ message: "Only a moderator can deny join requests." });
+    }
+    const userId = Number(req.params.userId);
+    const request = db.get(
+      "SELECT * FROM join_requests WHERE group_id = ? AND user_id = ? AND status = 'pending'",
+      [group.id, userId]
+    );
+    if (!request) return res.status(404).json({ message: "No pending request from that student." });
+    db.run("UPDATE join_requests SET status = 'denied' WHERE group_id = ? AND user_id = ?", [group.id, userId]);
+    res.json(groupPayload(db.get("SELECT * FROM groups WHERE id = ?", [group.id]), req.user.id));
+  });
+
+  app.post("/api/groups/:id/members/:userId/promote", authMiddleware, (req, res) => {
+    const group = db.get("SELECT * FROM groups WHERE id = ?", [req.params.id]);
+    if (!group) return res.status(404).json({ message: "Group not found" });
+    if (group.created_by !== req.user.id) {
+      return res.status(403).json({ message: "Only the group creator can promote moderators." });
+    }
+    const userId = Number(req.params.userId);
+    if (!isMember(group.id, userId)) {
+      return res.status(404).json({ message: "That student is not a member of this group." });
+    }
+    db.run("UPDATE group_members SET role = 'admin' WHERE group_id = ? AND user_id = ?", [group.id, userId]);
+    res.json(groupPayload(db.get("SELECT * FROM groups WHERE id = ?", [group.id]), req.user.id));
   });
 
   app.post("/api/groups/:id/events", authMiddleware, (req, res) => {
@@ -315,7 +464,7 @@ async function main() {
     ]);
     if (!membership) return res.status(403).json({ message: "Join the group first." });
     if (membership.role !== "admin") {
-      return res.status(403).json({ message: "Only a group admin can create events." });
+      return res.status(403).json({ message: "Only a moderator can create events." });
     }
     const { title, description, location, starts_at } = req.body;
     if (!title || !location || !starts_at) {
